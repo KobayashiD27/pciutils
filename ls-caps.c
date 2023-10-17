@@ -10,6 +10,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <stdlib.h>
 
 #include "lspci.h"
 
@@ -1381,6 +1384,214 @@ static void cap_express_slot2(struct device *d UNUSED, int where UNUSED)
   /* No capabilities that require this field in PCIe rev2.0 spec. */
 }
 
+#define OBJNAMELEN 1024
+static int get_device_uid(struct device *d){
+  char link_path[OBJNAMELEN];
+  char path[OBJNAMELEN];
+  ssize_t bytes_read;
+  int n = snprintf(path, OBJNAMELEN, "%s/devices/%04x:%02x:%02x.%d",
+      pci_get_param(d->dev->access, "sysfs.path"), d->dev->domain, d->dev->bus, d->dev->dev, d->dev->func);
+  if (n < 0 || n >= OBJNAMELEN){
+    d->dev->access->error("sysfs file name error");
+    return -1;
+  }
+
+  /* get absolute path pointed by the sym link */
+  bytes_read = readlink(path, link_path, sizeof(link_path));
+  if (bytes_read == -1)
+    return -1;
+  
+  link_path[bytes_read] = '\0'; 
+  
+  char *path_copy = strdup(link_path);
+  char *token = strtok(path_copy, "/");
+  int device_uid;
+  while (token)
+  {
+    if (strncmp(token, "pci", 3) == 0)
+    {
+      char buffer[OBJNAMELEN];
+      sprintf(buffer, "/sys/devices/%s/firmware_node/uid", token);
+      FILE *file = fopen(buffer, "r");
+      if (file == NULL)
+      {
+        free(path_copy);
+        return -1;
+      }
+
+      char line[OBJNAMELEN];
+      while (fgets(line, sizeof(line), file) != NULL)
+      {
+        if (sscanf(line, "%d", &device_uid) == 1)
+        {
+          fclose(file);
+          free(path_copy);
+          return device_uid;
+        }
+      }
+      fclose(file);
+    }
+    token = strtok(NULL, "/");
+  }
+  free(path_copy);
+  return -1;
+}
+
+static off_t get_rcrb_base(int device_uid){
+  FILE *cedt_file = fopen("/sys/firmware/acpi/tables/CEDT", "rb");
+  if (cedt_file == NULL)
+    return -1;
+
+  struct CEDT_Header header;
+  fread(&header, sizeof(header), 1, cedt_file);
+  
+  struct CHBS_Structure chbs;
+  chbs.base = 0;
+  size_t total_bytes_read = 0;
+  while (total_bytes_read < header.length)
+  {
+    struct CEDT_Structure cedt;
+    size_t bytes_read = fread(&cedt, sizeof(cedt), 1, cedt_file);
+    if (bytes_read != 1)
+    {
+      fclose(cedt_file);
+      return -1;
+    }
+    total_bytes_read += sizeof(cedt);
+    if (cedt.type == CHBS_TYPE)
+    {
+      bytes_read = fread(&chbs, sizeof(chbs), 1, cedt_file);
+      if(bytes_read != 1){
+        fclose(cedt_file);
+        return -1;
+      }
+      total_bytes_read += sizeof(chbs);
+      if ((int)chbs.uid == device_uid){
+        if(chbs.cxl_version == 0){
+          fclose(cedt_file);
+          return chbs.base;
+        }else{
+          fclose(cedt_file);
+          return -1;
+        }
+      } 
+    }
+    else
+    {
+      fseek(cedt_file, cedt.record_length - sizeof(cedt), SEEK_SET);
+      total_bytes_read += cedt.record_length;
+    }
+  }
+  fclose(cedt_file);
+  return -1;
+}
+
+static uint32_t read_pci_config(uint32_t* pcie_config_space, off_t offset) {
+    return *((uint32_t*)((uint8_t*)pcie_config_space + offset));
+}
+
+static void cap_express_link_rcd(struct device *d)
+{
+  /* Check whether the device is cxl 1.1 device or not */
+  int device_uid = get_device_uid(d);
+  if (device_uid < 0)
+    return;
+
+  off_t rcrb_base = get_rcrb_base(device_uid);
+  if(rcrb_base <= 0)
+    return;
+  
+  int mem_fd = open("/dev/mem", O_RDONLY | O_SYNC);
+  if (mem_fd == -1)
+    return;
+
+  /* Set target address(RCD = RCH + 4K) */
+  off_t target_address = rcrb_base + 0x1000;
+  long page_size = sysconf(_SC_PAGESIZE);
+  void *mem_ptr = mmap(NULL, page_size, PROT_READ, MAP_SHARED, mem_fd, target_address);
+  if (mem_ptr == MAP_FAILED)
+  {
+    close(mem_fd);
+    return;
+  }
+
+  /* Search PCIe Capability */
+  volatile uint32_t value = read_pci_config(mem_ptr, PCI_CAPABILITY_LIST);
+  volatile off_t offset = value & 0xFF;
+
+  while (1)
+  {
+    value = read_pci_config(mem_ptr, offset);
+    /* If find PCIe Capability, display the link status info */
+    if ((value & 0xFF) == PCI_CAP_ID_EXP)
+    {
+      u32 t, aspm, cap_speed, cap_width, sta_speed, sta_width;
+      u16 w;
+      t = read_pci_config(mem_ptr, offset + PCI_EXP_LNKCAP);
+      aspm = (t & PCI_EXP_LNKCAP_ASPM) >> 10;
+      cap_speed = t & PCI_EXP_LNKCAP_SPEED;
+      cap_width = (t & PCI_EXP_LNKCAP_WIDTH) >> 4;
+      printf("\t\tLnkCap:\tPort #%d, Speed %s, Width x%d, ASPM %s",
+              t >> 24,
+              link_speed(cap_speed), cap_width,
+              aspm_support(aspm));
+      if (aspm)
+      {
+        printf(", Exit Latency ");
+        if (aspm & 1)
+          printf("L0s %s", latency_l0s((t & PCI_EXP_LNKCAP_L0S) >> 12));
+        if (aspm & 2)
+          printf("%sL1 %s", (aspm & 1) ? ", " : "",
+                  latency_l1((t & PCI_EXP_LNKCAP_L1) >> 15));
+      }
+      printf("\n");
+      printf("\t\t\tClockPM%c Surprise%c LLActRep%c BwNot%c ASPMOptComp%c\n",
+              FLAG(t, PCI_EXP_LNKCAP_CLOCKPM),
+              FLAG(t, PCI_EXP_LNKCAP_SURPRISE),
+              FLAG(t, PCI_EXP_LNKCAP_DLLA),
+              FLAG(t, PCI_EXP_LNKCAP_LBNC),
+              FLAG(t, PCI_EXP_LNKCAP_AOC));
+
+      t = read_pci_config(mem_ptr, offset + PCI_EXP_LNKCTL);
+      w = (uint16_t)(t & 0xffff);
+      printf("\t\tLnkCtl:\tASPM %s;", aspm_enabled(w & PCI_EXP_LNKCTL_ASPM));
+      printf(" Disabled%c CommClk%c\n\t\t\tExtSynch%c ClockPM%c AutWidDis%c BWInt%c AutBWInt%c\n",
+              FLAG(w, PCI_EXP_LNKCTL_DISABLE),
+              FLAG(w, PCI_EXP_LNKCTL_CLOCK),
+              FLAG(w, PCI_EXP_LNKCTL_XSYNCH),
+              FLAG(w, PCI_EXP_LNKCTL_CLOCKPM),
+              FLAG(w, PCI_EXP_LNKCTL_HWAUTWD),
+              FLAG(w, PCI_EXP_LNKCTL_BWMIE),
+              FLAG(w, PCI_EXP_LNKCTL_AUTBWIE));
+
+      w = (uint16_t)((t >> 16) & 0xffff);
+      sta_speed = w & PCI_EXP_LNKSTA_SPEED;
+      sta_width = (w & PCI_EXP_LNKSTA_WIDTH) >> 4;
+      printf("\t\tLnkSta:\tSpeed %s%s, Width x%d%s\n",
+              link_speed(sta_speed),
+              link_compare(PCI_EXP_TYPE_ROOT_INT_EP, sta_speed, cap_speed),
+              sta_width,
+              link_compare(PCI_EXP_TYPE_ROOT_INT_EP, sta_width, cap_width));
+      printf("\t\t\tTrErr%c Train%c SlotClk%c DLActive%c BWMgmt%c ABWMgmt%c\n",
+              FLAG(w, PCI_EXP_LNKSTA_TR_ERR),
+              FLAG(w, PCI_EXP_LNKSTA_TRAIN),
+              FLAG(w, PCI_EXP_LNKSTA_SL_CLK),
+              FLAG(w, PCI_EXP_LNKSTA_DL_ACT),
+              FLAG(w, PCI_EXP_LNKSTA_BWMGMT),
+              FLAG(w, PCI_EXP_LNKSTA_AUTBW));
+      break;
+    }else{ /* else get Next Capability Pointer, and move the pointer */
+      offset = (value >> 8) & 0xFF;
+      if (offset == 0)
+        break;
+    }
+  }
+
+  munmap(mem_ptr, page_size);
+  close(mem_fd);
+  return;
+}
+
 static int
 cap_express(struct device *d, int where, int cap)
 {
@@ -1445,6 +1656,11 @@ cap_express(struct device *d, int where, int cap)
   cap_express_dev(d, where, type);
   if (link)
     cap_express_link(d, where, type);
+  else if (type == PCI_EXP_TYPE_ROOT_INT_EP)
+  {
+    cap_express_link_rcd(d);
+  }
+    
   if (slot)
     cap_express_slot(d, where);
   if (type == PCI_EXP_TYPE_ROOT_PORT || type == PCI_EXP_TYPE_ROOT_EC)

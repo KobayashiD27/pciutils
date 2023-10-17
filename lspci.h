@@ -58,6 +58,41 @@ u32 get_conf_long(struct device *d, unsigned int pos);
 word get_conf_word(struct device *d, unsigned int pos);
 byte get_conf_byte(struct device *d, unsigned int pos);
 
+/* access to CEDT structure*/
+
+#pragma pack(1)
+#define CHBS_TYPE 0
+
+// CHBS Structure
+struct CHBS_Structure {
+    uint32_t uid;                // UID (4 bytes)
+    uint32_t cxl_version;         // CXL Version (4 bytes)
+    uint32_t reserved2;          // Reserved (4 bytes)
+    uint64_t base;               // Base (8 bytes)
+    uint64_t length;             // Length (8 bytes)
+};
+
+// CEDT Structure Header
+struct CEDT_Structure {
+    uint8_t type;                  // Type (1 byte)
+    uint8_t reserved;              // Reserved (1 byte)
+    uint16_t record_length;         // Record Length (2 bytes)
+};
+
+// CEDT Header
+struct CEDT_Header {
+    uint32_t signature;          // Signature (4 bytes)
+    uint32_t length;             // Length (4 bytes)
+    uint8_t revision;            // Revision (1 byte)
+    uint8_t checksum;            // Checksum (1 byte)
+    char oem_ID[6];               // OEM ID (6 bytes)
+    char oem_tableID[8];          // OEM Table ID (8 bytes)
+    uint32_t oem_Revision;        // OEM Revision (4 bytes)
+    uint32_t creatorID;          // Creator ID (4 bytes)
+    uint32_t creator_revision;    // Creator Revision (4 bytes)
+};
+#pragma pack()
+
 /* Useful macros for decoding of bits and bit fields */
 
 #define FLAG(x,y) ((x & y) ? '+' : '-')
